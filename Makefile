@@ -1,87 +1,143 @@
-# Copyright (c) 2015-2016, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2017, NVIDIA CORPORATION. All rights reserved.
 
-NV_DOCKER ?= docker
+DOCKER ?= docker
+MKDIR  ?= mkdir
+DIST_DIR ?= $(CURDIR)/dist
 
-prefix      ?= /usr/local
-exec_prefix ?= $(prefix)
-bindir      ?= $(exec_prefix)/bin
+LIB_NAME := nvidia-docker2
+LIB_VERSION := 2.4.0
+PKG_REV := 1
 
-CR_NAME  := NVIDIA CORPORATION
-CR_EMAIL := digits@nvidia.com
-PKG_NAME := nvidia-docker
-PKG_VERS := 1.0.1
-PKG_REV  := 1
-ifneq ($(MAKECMDGOALS),rpm)
-PKG_ARCH := amd64
-else
-PKG_ARCH := x86_64
+RUNTIME_VERSION := 3.3.0
+
+# Supported OSs by architecture
+AMD64_TARGETS := ubuntu20.04 ubuntu18.04 ubuntu16.04 debian10 debian9
+X86_64_TARGETS := centos7 centos8 rhel7 rhel8 amazonlinux1 amazonlinux2 opensuse-leap15.1
+PPC64LE_TARGETS := ubuntu18.04 ubuntu16.04 centos7 centos8 rhel7 rhel8
+ARM64_TARGETS := ubuntu20.04 ubuntu18.04
+AARCH64_TARGETS := centos8 rhel8
+
+# By default run all native docker-based targets
+docker-native:
+
+# Define top-level build targets
+docker%: SHELL:=/bin/bash
+
+# Native targets
+PLATFORM ?= $(shell uname -m)
+ifeq ($(PLATFORM),x86_64)
+NATIVE_TARGETS := $(AMD64_TARGETS) $(X86_64_TARGETS)
+$(AMD64_TARGETS): %: %-amd64
+$(X86_64_TARGETS): %: %-x86_64
+else ifeq ($(PLATFORM),ppc64le)
+NATIVE_TARGETS := $(PPC64LE_TARGETS)
+$(PPC64LE_TARGETS): %: %-ppc64le
+else ifeq ($(PLATFORM),aarch64)
+NATIVE_TARGETS := $(ARM64_TARGETS) $(AARCH64_TARGETS)
+$(ARM64_TARGETS): %: %-arm64
+$(AARCH64_TARGETS): %: %-aarch64
 endif
+docker-native: $(NATIVE_TARGETS)
 
-# Mirror the BUILD_ARCH from the build Dockerfile
-BUILD_ARCH = .$(shell uname -m)
-ifneq ($(BUILD_ARCH),.ppc64le)
-    BUILD_ARCH =
-else
-    PKG_ARCH = ppc64le
-endif
+# amd64 targets
+AMD64_TARGETS := $(patsubst %, %-amd64, $(AMD64_TARGETS))
+$(AMD64_TARGETS): ARCH := amd64
+$(AMD64_TARGETS): %: --%
+docker-amd64: $(AMD64_TARGETS)
 
-BIN_DIR    := $(CURDIR)/bin
-DIST_DIR   := $(CURDIR)/dist
-BUILD_DIR  := $(CURDIR)/build
-DOCKER_BIN := $(BIN_DIR)/nvidia-docker
-PLUGIN_BIN := $(BIN_DIR)/nvidia-docker-plugin
+# x86_64 targets
+X86_64_TARGETS := $(patsubst %, %-x86_64, $(X86_64_TARGETS))
+$(X86_64_TARGETS): ARCH := x86_64
+$(X86_64_TARGETS): %: --%
+docker-x86_64: $(X86_64_TARGETS)
 
-DOCKER_VERS      := $(shell $(NV_DOCKER) version -f '{{.Client.Version}}')
-DOCKER_VERS_MAJ  := $(shell echo $(DOCKER_VERS) | cut -d. -f1)
-DOCKER_VERS_MIN  := $(shell echo $(DOCKER_VERS) | cut -d. -f2)
+# arm64 targets
+ARM64_TARGETS := $(patsubst %, %-arm64, $(ARM64_TARGETS))
+$(ARM64_TARGETS): ARCH := arm64
+$(ARM64_TARGETS): %: --%
+docker-arm64: $(ARM64_TARGETS)
 
-DOCKER_RMI       := $(NV_DOCKER) rmi
-DOCKER_RUN       := $(NV_DOCKER) run --rm --net=host
-DOCKER_IMAGES    := $(NV_DOCKER) images -q $(PKG_NAME)
-DOCKER_BUILD     := $(NV_DOCKER) build --build-arg USER_ID="$(shell id -u)" \
-                                       --build-arg CR_NAME="$(CR_NAME)" \
-                                       --build-arg CR_EMAIL="$(CR_EMAIL)" \
-                                       --build-arg PKG_NAME="$(PKG_NAME)" \
-                                       --build-arg PKG_VERS="$(PKG_VERS)" \
-                                       --build-arg PKG_REV="$(PKG_REV)" \
-                                       --build-arg PKG_ARCH="$(PKG_ARCH)"
+# aarch64 targets
+AARCH64_TARGETS := $(patsubst %, %-aarch64, $(AARCH64_TARGETS))
+$(AARCH64_TARGETS): ARCH := aarch64
+$(AARCH64_TARGETS): %: --%
+docker-aarch64: $(AARCH64_TARGETS)
 
-.PHONY: all build install uninstall clean distclean tarball deb rpm
+# ppc64le targets
+PPC64LE_TARGETS := $(patsubst %, %-ppc64le, $(PPC64LE_TARGETS))
+$(PPC64LE_TARGETS): ARCH := ppc64le
+$(PPC64LE_TARGETS): WITH_LIBELF := yes
+$(PPC64LE_TARGETS): %: --%
+docker-ppc64le: $(PPC64LE_TARGETS)
 
-all: build
+# docker target to build for all os/arch combinations
+docker-all: $(AMD64_TARGETS) $(X86_64_TARGETS) \
+            $(ARM64_TARGETS) $(AARCH64_TARGETS) \
+            $(PPC64LE_TARGETS)
 
-build: distclean
-	@mkdir -p $(BIN_DIR)
-	@$(DOCKER_BUILD) -t $(PKG_NAME):$@ -f Dockerfile.$@$(BUILD_ARCH) $(CURDIR)
-	@$(DOCKER_RUN) -v $(BIN_DIR):/go/bin:Z $(PKG_NAME):$@
+# Default variables for all private '--' targets below.
+# One private target is defined for each OS we support.
+--%: TARGET_PLATFORM = $(*)
+--%: VERSION = $(patsubst $(OS)%-$(ARCH),%,$(TARGET_PLATFORM))
+--%: BASEIMAGE = $(OS):$(VERSION)
+--%: BUILDIMAGE = nvidia/$(LIB_NAME)/$(OS)$(VERSION)-$(ARCH)
+--%: DOCKERFILE = $(CURDIR)/docker/Dockerfile.$(OS)
+--%: ARTIFACTS_DIR = $(DIST_DIR)/$(OS)$(VERSION)/$(ARCH)
+--%: docker-build-%
+	@
 
-install: build
-	install -D -m 755 -t $(bindir) $(DOCKER_BIN)
-	install -D -m 755 -t $(bindir) $(PLUGIN_BIN)
+# private ubuntu target
+--ubuntu%: OS := ubuntu
+--ubuntu%: DOCKER_VERSION := docker-ce (>= 18.06.0~ce~3-0~ubuntu) | docker-ee (>= 18.06.0~ce~3-0~ubuntu) | docker.io (>= 18.06.0)
 
-uninstall:
-	$(RM) $(bindir)/$(notdir $(DOCKER_BIN))
-	$(RM) $(bindir)/$(notdir $(PLUGIN_BIN))
+# private debian target
+--debian%: OS := debian
+--debian%: DOCKER_VERSION := docker-ce (>= 18.06.0~ce~3-0~debian) | docker-ee (>= 18.06.0~ce~3-0~debian) | docker.io (>= 18.06.0)
 
-clean:
-	-@$(DOCKER_IMAGES) | xargs $(DOCKER_RMI) 2> /dev/null
-	-@$(DOCKER_RMI) golang:1.5 ubuntu:14.04 centos:7 2> /dev/null
+# private centos target
+--centos%: OS := centos
+--centos%: DOCKER_VERSION := docker-ce >= 18.06.3.ce-3.el7
+
+# private amazonlinuxtarget
+--amazonlinux%: OS := amazonlinux
+--amazonlinux2%: DOCKER_VERSION := docker >= 18.06.1ce-2.amzn2
+--amazonlinux1%: DOCKER_VERSION := docker >= 18.06.1ce-2.16.amzn1
+
+# private opensuse-leap target
+--opensuse-leap%: OS := opensuse-leap
+--opensuse-leap%: BASEIMAGE = opensuse/leap:$(VERSION)
+--opensuse-leap%: DOCKER_VERSION := docker >= 18.09.1_ce
+
+# private rhel target (actually built on centos)
+--rhel%: OS := centos
+--rhel%: VERSION = $(patsubst rhel%-$(ARCH),%,$(TARGET_PLATFORM))
+--rhel%: ARTIFACTS_DIR = $(DIST_DIR)/rhel$(VERSION)/$(ARCH)
+--rhel%: DOCKER_VERSION := docker-ce >= 18.06.3.ce-3.el7
+
+docker-build-%:
+	@echo "Building for $(TARGET_PLATFORM)"
+	docker pull --platform=linux/$(ARCH) $(BASEIMAGE)
+	DOCKER_BUILDKIT=1 \
+	$(DOCKER) build \
+	    --progress=plain \
+	    --build-arg BASEIMAGE=$(BASEIMAGE) \
+	    --build-arg DOCKER_VERSION="$(DOCKER_VERSION)" \
+	    --build-arg RUNTIME_VERSION="$(RUNTIME_VERSION)" \
+	    --build-arg PKG_VERS="$(LIB_VERSION)" \
+	    --build-arg PKG_REV="$(PKG_REV)" \
+	    --tag $(BUILDIMAGE) \
+	    --file $(DOCKERFILE) .
+	$(DOCKER) run \
+	    -e DISTRIB \
+	    -e SECTION \
+	    -v $(ARTIFACTS_DIR):/dist \
+	    $(BUILDIMAGE)
+
+docker-clean:
+	IMAGES=$$(docker images "nvidia/$(LIB_NAME)/*" --format="{{.ID}}"); \
+	if [ "$${IMAGES}" != "" ]; then \
+	    docker rmi -f $${IMAGES}; \
+	fi
 
 distclean:
-	@rm -rf $(BIN_DIR)
-	@rm -rf $(DIST_DIR)
-
-tarball: build
-	@mkdir -p $(DIST_DIR)
-	tar --transform='s;.*/;$(PKG_NAME)/;' -caf $(DIST_DIR)/$(PKG_NAME)_$(PKG_VERS)_$(PKG_ARCH).tar.xz $(BIN_DIR)/*
-	@printf "\nFind tarball at $(DIST_DIR)\n\n"
-
-deb: tarball
-	@$(DOCKER_BUILD) -t $(PKG_NAME):$@ -f Dockerfile.$@$(BUILD_ARCH) $(CURDIR)
-	@$(DOCKER_RUN) -ti -v $(DIST_DIR):/dist:Z -v $(BUILD_DIR):/build:Z $(PKG_NAME):$@
-	@printf "\nFind packages at $(DIST_DIR)\n\n"
-
-rpm: tarball
-	@$(DOCKER_BUILD) -t $(PKG_NAME):$@ -f Dockerfile.$@$(BUILD_ARCH) $(CURDIR)
-	@$(DOCKER_RUN) -ti -v $(DIST_DIR):/dist:Z -v $(BUILD_DIR):/build:Z $(PKG_NAME):$@
-	@printf "\nFind packages at $(DIST_DIR)\n\n"
+	rm -rf $(DIST_DIR)
